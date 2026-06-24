@@ -36,7 +36,7 @@
       pointer-events: none;
     }
 
-    /* Coze全屏容器 - 必须指定宽高，作为窗口挂载节点 */
+    /* Coze全屏容器 */
     #coze-container {
       position: fixed;
       top: 0;
@@ -54,8 +54,7 @@
       pointer-events: auto !important;
     }
 
-    /********** 强制全屏高权重样式（兜底） **********/
-    /* 匹配挂载在容器内的所有子元素 */
+    /* 强制容器内元素全屏 */
     #coze-container > div,
     #coze-container > div > iframe,
     #coze-container .coze-chat-widget,
@@ -64,19 +63,14 @@
       height: 100% !important;
       max-width: 100% !important;
       max-height: 100% !important;
-      min-width: 100% !important;
-      min-height: 100% !important;
       top: 0 !important;
       left: 0 !important;
-      right: auto !important;
-      bottom: 0 !important;
       border-radius: 0 !important;
       margin: 0 !important;
-      padding: 0 !important;
       transform: none !important;
     }
 
-    /* 隐藏所有多余控件：关闭、最大化、悬浮球、底部官方标识 */
+    /* 隐藏所有多余控件 */
     .coze-chat-header-close,
     .coze-chat-header-fullscreen,
     .coze-chat-asst-btn,
@@ -86,34 +80,37 @@
       display: none !important;
     }
 
-    /* 隐藏Coze自带语音输入按钮，统一走讯飞语音 */
-    .coze-chat-input-voice-btn {
+    /* 彻底隐藏Coze自带语音输入按钮，统一走讯飞语音 */
+    .coze-chat-input-voice-btn,
+    .coze-chat-input-voice,
+    button[aria-label="语音输入"] {
       display: none !important;
     }
 
-    /* 状态提示条 */
+    /* 状态提示条 - 最高层级，永远不被遮挡 */
     #statusTip {
       position: fixed;
       top: 20px;
       left: 50%;
       transform: translateX(-50%);
       padding: 10px 24px;
-      background: rgba(0,0,0,0.75);
+      background: rgba(0,0,0,0.8);
       color: #fff;
       border-radius: 24px;
       font-size: 15px;
-      z-index: 99999;
+      z-index: 999999 !important; /* 拉到最高层级 */
       max-width: 90%;
       text-align: center;
       transition: opacity 0.3s;
+      pointer-events: none;
     }
     .status-error {
-      background: rgba(200, 0, 0, 0.8) !important;
+      background: rgba(200, 0, 0, 0.85) !important;
     }
     .status-success {
-      background: rgba(0, 150, 0, 0.8) !important;
+      background: rgba(0, 150, 0, 0.85) !important;
     }
-    .hide { opacity: 0; pointer-events: none; }
+    .hide { opacity: 0; }
   </style>
 </head>
 <body>
@@ -303,8 +300,9 @@
         return;
       }
 
-      showStatus('正在启动语音服务...');
-      startWakeUpListen();
+      // Coze加载完成后，主动申请麦克风权限并启动语音监听
+      showStatus('正在申请麦克风权限...');
+      setTimeout(() => startWakeUpListen(), 1000);
     });
 
     function waitCozeSdkReady() {
@@ -325,7 +323,7 @@
     }
 
     /**************************
-     * Coze 初始化（官方规范配置，核心修复）
+     * Coze 初始化
      **************************/
     function initCoze() {
       return new Promise(resolve => {
@@ -340,39 +338,35 @@
               token: CONFIG.coze.token,
               onRefreshToken: () => Promise.resolve(CONFIG.coze.token)
             },
-            // 【关键修复】严格按照官方层级配置UI
             ui: {
               base: {
-                layout: 'mobile', // 强制移动端布局，官方定义：移动端会铺满全屏
+                layout: 'mobile',
                 zIndex: 10,
                 lang: 'zh-CN'
               },
               header: {
                 isShow: true,
-                isNeedClose: false // 隐藏关闭按钮
+                isNeedClose: false
               },
               asstBtn: {
-                isNeed: false // 隐藏悬浮球
+                isNeed: false
               },
               chatBot: {
                 title: '智能销售助手',
-                el: cozeContainer, // 【核心】指定挂载到我们的全屏容器，不再挂在body右下角
-                width: '100%', // 宽度100%
-                height: '100%' // 高度100%
+                el: cozeContainer,
+                width: '100%',
+                height: '100%'
               }
             },
             onLoad: () => {
               setTimeout(() => {
                 cozeClient.showChatBot();
-                // 显示聊天界面，隐藏启动视频
                 cozeContainer.classList.add('chat-show');
                 bgVideo.classList.add('video-hide');
-                showStatus('系统就绪，说「你好小玄」唤醒我', false, true);
                 resolve(true);
               }, 500);
             },
             onMessage: (msg) => {
-              // 收到回复自动播放语音
               if (msg.is_success && !msg.is_from_self) {
                 setTimeout(() => autoPlayVoice(), 800);
               }
@@ -383,7 +377,6 @@
             }
           });
 
-          // 兜底：5秒后强制显示
           setTimeout(() => {
             if (cozeClient?.showChatBot) {
               cozeClient.showChatBot();
@@ -412,12 +405,13 @@
     }
 
     /**************************
-     * 音频采集
+     * 音频采集 + 权限申请
      **************************/
     async function startAudioCapture() {
       try {
-        if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前环境不支持音频采集');
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器不支持语音功能');
         
+        // 主动申请麦克风权限
         mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
@@ -451,8 +445,9 @@
       } catch (err) {
         console.error('麦克风采集失败:', err);
         let msg = err.message;
-        if (err.name === 'NotAllowedError') msg = '麦克风权限被拒绝，请在设置中允许';
+        if (err.name === 'NotAllowedError') msg = '麦克风权限被拒绝，请在浏览器设置中允许';
         if (err.name === 'NotFoundError') msg = '未检测到麦克风设备';
+        if (err.name === 'NotSupportedError') msg = '当前浏览器不支持语音采集';
         showStatus('麦克风启动失败：' + msg, true);
         return false;
       }
@@ -486,13 +481,14 @@
           sendFirstFrame();
           isListening = true;
           reconnectCount = 0;
+          showStatus('语音监听已启动，说「你好小玄」唤醒我', false, false);
         };
 
         ws.onmessage = (event) => {
           try {
             const res = JSON.parse(event.data);
             if (res.code !== 0) {
-              console.error('讯飞识别错误:', res.message);
+              showStatus('语音识别错误：' + res.message, true);
               return;
             }
             if (res.data?.result?.ws) {
@@ -505,7 +501,9 @@
           }
         };
 
-        ws.onerror = () => console.log('讯飞连接异常');
+        ws.onerror = () => {
+          showStatus('语音连接异常，正在重连...');
+        };
 
         ws.onclose = () => {
           isListening = false;
@@ -516,7 +514,7 @@
         };
       } catch (e) {
         console.error('连接讯飞失败:', e);
-        showStatus('语音服务连接失败', true);
+        showStatus('语音服务连接失败：' + e.message, true);
       }
     }
 
@@ -592,7 +590,7 @@
       stopWakeUpListen();
       setTimeout(() => {
         startWakeUpListen();
-        showStatus('等待唤醒，说「你好小玄」', false, true);
+        showStatus('等待唤醒，说「你好小玄」', false, false);
       }, 500);
     }
 
@@ -601,6 +599,7 @@
      **************************/
     async function startWakeUpListen() {
       if (isListening) return;
+      showStatus('正在启动语音监听...');
       const ok = await startAudioCapture();
       if (ok) connectXunfei();
     }
@@ -622,7 +621,7 @@
     /**************************
      * 工具函数
      **************************/
-    function showStatus(text, isError = false, autoHide = true) {
+    function showStatus(text, isError = false, autoHide = false) {
       statusTip.textContent = text;
       statusTip.classList.remove('hide');
       statusTip.classList.toggle('status-error', isError);
