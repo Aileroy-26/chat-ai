@@ -11,6 +11,7 @@
       margin: 0;
       padding: 0;
       box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
     }
     html, body {
       width: 100vw;
@@ -42,7 +43,7 @@
       top: 0;
       left: 0;
       width: 100vw !important;
-      height: 100vh !important;
+      height: calc(100vh - 70px) !important; /* 底部留出手动语音按钮空间 */
       z-index: 10;
       opacity: 0;
       pointer-events: none;
@@ -70,20 +71,13 @@
       transform: none !important;
     }
 
-    /* 隐藏所有多余控件 */
+    /* 隐藏多余控件，保留输入框和播放按钮 */
     .coze-chat-header-close,
     .coze-chat-header-fullscreen,
     .coze-chat-asst-btn,
     .coze-chat-float-btn,
     .coze-chat-official-banner,
     .web_sdk_official_banner {
-      display: none !important;
-    }
-
-    /* 彻底隐藏Coze自带语音输入按钮，统一走讯飞语音 */
-    .coze-chat-input-voice-btn,
-    .coze-chat-input-voice,
-    button[aria-label="语音输入"] {
       display: none !important;
     }
 
@@ -112,6 +106,8 @@
     #startMask .tip-desc {
       opacity: 0.8;
       margin-bottom: 30px;
+      text-align: center;
+      padding: 0 20px;
     }
     #startBtn {
       padding: 14px 40px;
@@ -123,7 +119,41 @@
       cursor: pointer;
     }
 
-    /* 状态提示条 - 最高层级，永远不被遮挡 */
+    /* 底部常驻手动语音按钮 - 全设备自适应 */
+    #manualVoiceBar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      width: 100vw;
+      height: 70px;
+      background: #1a1a1a;
+      border-top: 1px solid #333;
+      z-index: 9999;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 20px;
+    }
+    #voiceBtn {
+      width: 80%;
+      max-width: 400px;
+      height: 46px;
+      border: none;
+      border-radius: 23px;
+      background: linear-gradient(135deg, #1890ff, #722ed1);
+      color: #fff;
+      font-size: 16px;
+      font-weight: 500;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;
+    }
+    #voiceBtn:active,
+    #voiceBtn.recording {
+      background: linear-gradient(135deg, #ff4d4f, #cf1322);
+    }
+
+    /* 状态提示条 - 最高层级 */
     #statusTip {
       position: fixed;
       top: 20px;
@@ -133,12 +163,13 @@
       background: rgba(0,0,0,0.8);
       color: #fff;
       border-radius: 24px;
-      font-size: 15px;
+      font-size: 14px;
       z-index: 999999 !important;
       max-width: 90%;
       text-align: center;
       transition: opacity 0.3s;
       pointer-events: none;
+      word-break: break-all;
     }
     .status-error {
       background: rgba(200, 0, 0, 0.85) !important;
@@ -158,12 +189,17 @@
   <!-- 首次启动引导遮罩 -->
   <div id="startMask">
     <div class="tip-title">智能销售助手</div>
-    <div class="tip-desc">点击下方按钮，开启语音交互</div>
+    <div class="tip-desc">点击下方按钮开启语音交互<br>支持语音唤醒 + 手动按住说话</div>
     <button id="startBtn">点击启动语音服务</button>
   </div>
 
   <div id="statusTip">系统初始化中...</div>
   <div id="coze-container"></div>
+
+  <!-- 底部常驻手动语音按钮 -->
+  <div id="manualVoiceBar" style="display:none;">
+    <button id="voiceBtn">按住说话</button>
+  </div>
 
   <script>
     /**************************
@@ -187,7 +223,7 @@
         coolDownTime: 6000,
         silenceTime: 1800,
         maxNoSpeakTime: 3000,
-        cacheLength: 20 // 识别文本缓存长度，解决流式分段问题
+        cacheLength: 30
       }
     };
 
@@ -201,106 +237,109 @@
     let scriptProcessor = null;
     let isListening = false;
     let isConversing = false;
+    let isManualMode = false; // 是否手动说话模式
     let silenceTimer = null;
     let noSpeakTimer = null;
     let finalText = '';
-    let recognizeCache = ''; // 识别文本滑动缓存
+    let recognizeCache = '';
     let reconnectCount = 0;
-    const maxReconnect = 5;
+    const maxReconnect = 3;
     const statusTip = document.getElementById('statusTip');
     const bgVideo = document.getElementById('bgVideo');
     const cozeContainer = document.getElementById('coze-container');
     const startMask = document.getElementById('startMask');
     const startBtn = document.getElementById('startBtn');
+    const voiceBtn = document.getElementById('voiceBtn');
+    const manualVoiceBar = document.getElementById('manualVoiceBar');
 
     /**************************
-     * 纯JS HMAC-SHA256 零依赖
+     * 加密工具 - 优化兼容性版本
      **************************/
     (function() {
-      function add(x, y) { return ((x >>> 0) + (y >>> 0)) >>> 0; }
-      function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
-      function ch(x, y, z) { return (x & y) ^ (~x & z); }
-      function maj(x, y, z) { return (x & y) ^ (x & z) ^ (y & z); }
-      function sigma0(x) { return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22); }
-      function sigma1(x) { return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25); }
-      function gamma0(x) { return rotr(x, 7) ^ rotr(x, 18) ^ (x >>> 3); }
-      function gamma1(x) { return rotr(x, 17) ^ rotr(x, 19) ^ (x >>> 10); }
-
-      const K = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-      ];
+      function utf8Encode(str) {
+        return unescape(encodeURIComponent(str));
+      }
 
       function sha256(message) {
-        const bytes = new TextEncoder().encode(message);
-        const bitLen = bytes.length * 8;
-        const blocks = [];
-        for (let i = 0; i < bytes.length; i += 64) {
-          const block = new Uint8Array(64);
-          block.set(bytes.slice(i, i + 64));
-          blocks.push(block);
-        }
-        const lastBlock = blocks.length ? blocks[blocks.length - 1] : new Uint8Array(64);
-        const lastLen = bytes.length % 64;
-        lastBlock[lastLen] = 0x80;
-        if (lastLen >= 56) blocks.push(new Uint8Array(64));
-        const finalBlock = blocks[blocks.length - 1];
-        const view = new DataView(finalBlock.buffer);
-        view.setUint32(56, Math.floor(bitLen / 0x100000000), false);
-        view.setUint32(60, bitLen >>> 0, false);
+        const msg = utf8Encode(message);
+        const N = msg.length;
+        const K = new Uint32Array([
+          0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+          0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+          0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+          0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+          0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+          0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+          0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+          0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+        ]);
 
         let h0=0x6a09e667, h1=0xbb67ae85, h2=0x3c6ef372, h3=0xa54ff53a;
         let h4=0x510e527f, h5=0x9b05688c, h6=0x1f83d9ab, h7=0x5be0cd19;
 
-        for (const block of blocks) {
+        const blocks = Math.ceil((N + 9) / 64);
+        for (let block = 0; block < blocks; block++) {
           const w = new Uint32Array(64);
-          const bv = new DataView(block.buffer);
-          for (let i = 0; i < 16; i++) w[i] = bv.getUint32(i * 4, false);
-          for (let i = 16; i < 64; i++) w[i] = add(add(gamma1(w[i-2]), w[i-7]), add(gamma0(w[i-15]), w[i-16]));
+          for (let i = 0; i < 64; i++) {
+            const pos = block * 64 + i;
+            if (pos < N) w[i>>>2] |= msg.charCodeAt(pos) << (24 - (i%4)*8);
+            else if (pos === N) w[i>>>2] |= 0x80 << (24 - (i%4)*8);
+            else if (pos >= 56) {
+              if (i === 62) w[i] = Math.floor(N * 8 / 0x100000000);
+              if (i === 63) w[i] = (N * 8) >>> 0;
+            }
+          }
+          for (let i = 16; i < 64; i++) {
+            const s0 = (w[i-15]>>>7) ^ (w[i-15]>>>18) ^ (w[i-15]>>>3);
+            const s1 = (w[i-2]>>>17) ^ (w[i-2]>>>19) ^ (w[i-2]>>>10);
+            w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
+          }
+
           let a=h0, b=h1, c=h2, d=h3, e=h4, f=h5, g=h6, h=h7;
           for (let i = 0; i < 64; i++) {
-            const T1 = add(add(add(h, sigma1(e)), add(ch(e, f, g), K[i])), w[i]);
-            const T2 = add(sigma0(a), maj(a, b, c));
-            h=g; g=f; f=e; e=add(d, T1); d=c; c=b; b=a; a=add(T1, T2);
+            const S1 = (e>>>6) ^ (e>>>11) ^ (e>>>25);
+            const ch = (e & f) ^ (~e & g);
+            const temp1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
+            const S0 = (a>>>2) ^ (a>>>13) ^ (a>>>22);
+            const maj = (a & b) ^ (a & c) ^ (b & c);
+            const temp2 = (S0 + maj) >>> 0;
+            h = g; g = f; f = e; e = (d + temp1) >>> 0;
+            d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
           }
-          h0=add(h0,a); h1=add(h1,b); h2=add(h2,c); h3=add(h3,d);
-          h4=add(h4,e); h5=add(h5,f); h6=add(h6,g); h7=add(h7,h);
+          h0=(h0+a)>>>0; h1=(h1+b)>>>0; h2=(h2+c)>>>0; h3=(h3+d)>>>0;
+          h4=(h4+e)>>>0; h5=(h5+f)>>>0; h6=(h6+g)>>>0; h7=(h7+h)>>>0;
         }
-        const result = new Uint8Array(32);
-        const rv = new DataView(result.buffer);
-        rv.setUint32(0,h0,false); rv.setUint32(4,h1,false); rv.setUint32(8,h2,false); rv.setUint32(12,h3,false);
-        rv.setUint32(16,h4,false); rv.setUint32(20,h5,false); rv.setUint32(24,h6,false); rv.setUint32(28,h7,false);
-        return result;
+
+        const hex = (n) => ('00000000' + n.toString(16)).slice(-8);
+        return hex(h0)+hex(h1)+hex(h2)+hex(h3)+hex(h4)+hex(h5)+hex(h6)+hex(h7);
       }
 
       function hmacSha256(message, key) {
-        const msgBytes = new TextEncoder().encode(message);
-        let keyBytes = new TextEncoder().encode(key);
-        if (keyBytes.length > 64) keyBytes = sha256(key);
-        const paddedKey = new Uint8Array(64);
-        paddedKey.set(keyBytes);
-        const oKeyPad = new Uint8Array(64), iKeyPad = new Uint8Array(64);
-        for (let i = 0; i < 64; i++) { oKeyPad[i] = paddedKey[i] ^ 0x5c; iKeyPad[i] = paddedKey[i] ^ 0x36; }
-        const inner = new Uint8Array(64 + msgBytes.length);
-        inner.set(iKeyPad); inner.set(msgBytes, 64);
-        const innerHash = sha256(inner);
-        const outer = new Uint8Array(64 + 32);
-        outer.set(oKeyPad); outer.set(innerHash, 64);
-        return sha256(outer);
+        const msg = utf8Encode(message);
+        let k = utf8Encode(key);
+        if (k.length > 64) k = sha256(k);
+        const ipad = new Array(64), opad = new Array(64);
+        for (let i = 0; i < 64; i++) {
+          const c = i < k.length ? k.charCodeAt(i) : 0;
+          ipad[i] = String.fromCharCode(c ^ 0x36);
+          opad[i] = String.fromCharCode(c ^ 0x5c);
+        }
+        return sha256(opad.join('') + sha256(ipad.join('') + msg));
       }
 
-      function base64Encode(bytes) {
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-        return btoa(binary);
+      function base64Encode(str) {
+        return btoa(unescape(encodeURIComponent(str)));
       }
-      window.CryptoUtil = { hmacSha256, base64Encode };
+
+      function hexToBase64(hex) {
+        let bytes = '';
+        for (let i = 0; i < hex.length; i += 2) {
+          bytes += String.fromCharCode(parseInt(hex.substr(i, 2), 16));
+        }
+        return btoa(bytes);
+      }
+
+      window.CryptoUtil = { hmacSha256, base64Encode, hexToBase64 };
     })();
 
     /**************************
@@ -316,15 +355,17 @@
     }
 
     /**************************
-     * 讯飞鉴权
+     * 讯飞鉴权URL生成 - 严格对齐官方规范
      **************************/
     function generateAuthUrl() {
       const date = new Date().toUTCString();
       const signStr = `host: ${CONFIG.xunfei.host}\ndate: ${date}\nGET ${CONFIG.xunfei.path} HTTP/1.1`;
-      const signBytes = CryptoUtil.hmacSha256(signStr, CONFIG.xunfei.api_secret);
-      const signature = CryptoUtil.base64Encode(signBytes);
+      const signHex = CryptoUtil.hmacSha256(signStr, CONFIG.xunfei.api_secret);
+      const signature = CryptoUtil.hexToBase64(signHex);
+      
       const authOrigin = `api_key="${CONFIG.xunfei.api_key}", algorithm="hmac-sha256", headers="host date request-line", signature="${signature}"`;
-      const authorization = CryptoUtil.base64Encode(new TextEncoder().encode(authOrigin));
+      const authorization = CryptoUtil.base64Encode(authOrigin);
+      
       return `wss://${CONFIG.xunfei.host}${CONFIG.xunfei.path}?authorization=${encodeURIComponent(authorization)}&date=${encodeURIComponent(date)}&host=${CONFIG.xunfei.host}`;
     }
 
@@ -338,28 +379,68 @@
         document.addEventListener('touchstart', () => bgVideo.play(), { once: true });
       });
 
-      // 先加载Coze
+      // 加载Coze
       await waitCozeSdkReady();
       showStatus('正在初始化聊天组件...');
       const cozeOk = await initCoze();
       if (!cozeOk) {
-        showStatus('聊天组件初始化失败，请刷新重试', true);
+        showStatus('聊天组件初始化失败，请刷新重试', true, false);
         return;
       }
 
-      // 显示启动引导，等待用户点击后再启动语音（适配移动端限制）
-      showStatus('点击屏幕按钮启动语音服务', false, false);
+      showStatus('点击按钮启动语音服务', false, false);
     });
 
-    // 点击启动按钮，正式启动语音服务
+    // 点击启动语音服务
     startBtn.addEventListener('click', async () => {
       startMask.style.display = 'none';
-      showStatus('正在申请麦克风权限...');
-      // 用户手势触发，启动语音监听
+      manualVoiceBar.style.display = 'flex';
       await startWakeUpListen();
     });
 
-    // 页面可见性变化时恢复音频上下文
+    // 手动语音按钮事件
+    const startManualRecord = (e) => {
+      e.preventDefault();
+      if (!isListening) return;
+      isManualMode = true;
+      isConversing = true;
+      finalText = '';
+      recognizeCache = '';
+      voiceBtn.classList.add('recording');
+      voiceBtn.textContent = '松开结束说话';
+      clearTimeout(silenceTimer);
+    };
+
+    const endManualRecord = (e) => {
+      e.preventDefault();
+      if (!isManualMode) return;
+      voiceBtn.classList.remove('recording');
+      voiceBtn.textContent = '按住说话';
+      
+      if (finalText.trim() && cozeClient) {
+        cozeClient.sendMessage({
+          content: finalText.trim(),
+          contentType: 'text'
+        });
+      }
+
+      isManualMode = false;
+      isConversing = false;
+      finalText = '';
+      recognizeCache = '';
+
+      // 重启唤醒监听
+      stopWakeUpListen();
+      setTimeout(() => startWakeUpListen(), 500);
+    };
+
+    voiceBtn.addEventListener('mousedown', startManualRecord);
+    voiceBtn.addEventListener('mouseup', endManualRecord);
+    voiceBtn.addEventListener('mouseleave', endManualRecord);
+    voiceBtn.addEventListener('touchstart', startManualRecord, { passive: false });
+    voiceBtn.addEventListener('touchend', endManualRecord, { passive: false });
+
+    // 页面可见性恢复
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden && audioContext && audioContext.state === 'suspended') {
         audioContext.resume();
@@ -466,13 +547,12 @@
     }
 
     /**************************
-     * 音频采集 + 权限申请
+     * 音频采集
      **************************/
     async function startAudioCapture() {
       try {
         if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器不支持语音功能');
         
-        // 用户手势触发的麦克风申请
         mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
@@ -488,10 +568,7 @@
         audioContext = new (window.AudioContext || window.webkitAudioContext)({
           sampleRate: actualSampleRate
         });
-        // 移动端必须手动resume解锁
-        if (audioContext.state === 'suspended') {
-          await audioContext.resume();
-        }
+        if (audioContext.state === 'suspended') await audioContext.resume();
 
         const source = audioContext.createMediaStreamSource(mediaStream);
         scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
@@ -510,7 +587,7 @@
       } catch (err) {
         console.error('麦克风采集失败:', err);
         let msg = err.message;
-        if (err.name === 'NotAllowedError') msg = '麦克风权限被拒绝，请在浏览器设置中允许';
+        if (err.name === 'NotAllowedError') msg = '麦克风权限被拒绝，请在设置中允许';
         if (err.name === 'NotFoundError') msg = '未检测到麦克风设备';
         if (err.name === 'NotSupportedError') msg = '当前浏览器不支持语音采集';
         showStatus('麦克风启动失败：' + msg, true, false);
@@ -535,7 +612,7 @@
     }
 
     /**************************
-     * 讯飞WebSocket + 重连
+     * 讯飞WebSocket连接 + 详细错误提示
      **************************/
     function connectXunfei() {
       try {
@@ -543,6 +620,7 @@
         ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
+          // 连接建立立即发送首帧，避免超时断开
           sendFirstFrame();
           isListening = true;
           reconnectCount = 0;
@@ -554,15 +632,16 @@
           try {
             const res = JSON.parse(event.data);
             if (res.code !== 0) {
-              showStatus('语音识别错误：' + res.message, true);
+              // 显示具体错误码和原因
+              const errMsg = `识别错误(${res.code})：${res.message}`;
+              showStatus(errMsg, true, false);
+              console.error('讯飞识别错误:', res);
               return;
             }
-            // 拼接识别结果
             if (res.data?.result?.ws) {
               let text = '';
               res.data.result.ws.forEach(item => text += item.cw[0].w);
               
-              // 滑动缓存识别文本，解决流式分段问题
               recognizeCache += text;
               if (recognizeCache.length > CONFIG.wake.cacheLength) {
                 recognizeCache = recognizeCache.slice(-CONFIG.wake.cacheLength);
@@ -575,13 +654,22 @@
           }
         };
 
-        ws.onerror = () => {
-          showStatus('语音连接异常，正在重连...');
+        ws.onerror = (event) => {
+          console.error('WebSocket错误:', event);
+          showStatus('语音连接异常，正在重连...', true, false);
         };
 
-        ws.onclose = () => {
+        ws.onclose = (event) => {
           isListening = false;
-          if (!isConversing && reconnectCount < maxReconnect) {
+          console.log('WebSocket关闭，code:', event.code, 'reason:', event.reason);
+          
+          // 显示具体断开原因
+          if (event.code !== 1000 && event.code !== 1005) {
+            showStatus(`连接断开(${event.code})：${event.reason || '鉴权失败，请检查密钥'}`, true, false);
+          }
+
+          // 非手动断开且未达最大重连次数则重连
+          if (!isConversing && !isManualMode && reconnectCount < maxReconnect) {
             reconnectCount++;
             setTimeout(() => startWakeUpListen(), 2000);
           }
@@ -619,10 +707,16 @@
     }
 
     /**************************
-     * 唤醒匹配 + 对话逻辑（核心优化）
+     * 唤醒 + 对话逻辑
      **************************/
     function handleRecognitionResult(cacheText) {
-      // 对话模式：累积识别结果，静默后发送
+      // 手动说话模式不触发唤醒
+      if (isManualMode) {
+        finalText = cacheText;
+        return;
+      }
+
+      // 对话模式
       if (isConversing) {
         finalText = cacheText;
         clearTimeout(silenceTimer);
@@ -630,22 +724,20 @@
         return;
       }
 
-      // 待唤醒模式：匹配唤醒词（模糊匹配，包含任意唤醒词即触发）
+      // 待唤醒模式
       const match = CONFIG.wake.keywords.some(keyword => cacheText.includes(keyword));
       if (match) wakeUpSuccess();
     }
 
-    // 唤醒成功
     function wakeUpSuccess() {
       isConversing = true;
       finalText = '';
-      recognizeCache = ''; // 清空缓存，避免重复唤醒
+      recognizeCache = '';
       showStatus('我在呢，请说话~', false, true);
       clearTimeout(noSpeakTimer);
       noSpeakTimer = setTimeout(endConversation, CONFIG.wake.maxNoSpeakTime);
     }
 
-    // 发送用户消息给Coze
     function sendUserMessage() {
       clearTimeout(silenceTimer);
       clearTimeout(noSpeakTimer);
@@ -661,7 +753,6 @@
       setTimeout(endConversation, CONFIG.wake.coolDownTime);
     }
 
-    // 结束对话，回到待唤醒
     function endConversation() {
       clearTimeout(silenceTimer);
       clearTimeout(noSpeakTimer);
