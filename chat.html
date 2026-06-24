@@ -87,6 +87,42 @@
       display: none !important;
     }
 
+    /* 首次启动引导遮罩 */
+    #startMask {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(0,0,0,0.6);
+      z-index: 999998;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      color: #fff;
+      font-size: 18px;
+      backdrop-filter: blur(4px);
+    }
+    #startMask .tip-title {
+      font-size: 22px;
+      font-weight: bold;
+      margin-bottom: 12px;
+    }
+    #startMask .tip-desc {
+      opacity: 0.8;
+      margin-bottom: 30px;
+    }
+    #startBtn {
+      padding: 14px 40px;
+      background: linear-gradient(135deg, #1890ff, #722ed1);
+      border: none;
+      border-radius: 30px;
+      color: #fff;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
     /* 状态提示条 - 最高层级，永远不被遮挡 */
     #statusTip {
       position: fixed;
@@ -98,7 +134,7 @@
       color: #fff;
       border-radius: 24px;
       font-size: 15px;
-      z-index: 999999 !important; /* 拉到最高层级 */
+      z-index: 999999 !important;
       max-width: 90%;
       text-align: center;
       transition: opacity 0.3s;
@@ -118,6 +154,13 @@
   <video id="bgVideo" autoplay loop muted playsinline webkit-playsinline x5-playsinline x5-video-player-type="h5">
     <source src="./logo.mp4" type="video/mp4">
   </video>
+
+  <!-- 首次启动引导遮罩 -->
+  <div id="startMask">
+    <div class="tip-title">智能销售助手</div>
+    <div class="tip-desc">点击下方按钮，开启语音交互</div>
+    <button id="startBtn">点击启动语音服务</button>
+  </div>
 
   <div id="statusTip">系统初始化中...</div>
   <div id="coze-container"></div>
@@ -143,7 +186,8 @@
         keywords: ['你好小玄', '你好小旋', '你好小璇', '你好小炫', '你好小选', '你好小轩'],
         coolDownTime: 6000,
         silenceTime: 1800,
-        maxNoSpeakTime: 3000
+        maxNoSpeakTime: 3000,
+        cacheLength: 20 // 识别文本缓存长度，解决流式分段问题
       }
     };
 
@@ -160,11 +204,14 @@
     let silenceTimer = null;
     let noSpeakTimer = null;
     let finalText = '';
+    let recognizeCache = ''; // 识别文本滑动缓存
     let reconnectCount = 0;
     const maxReconnect = 5;
     const statusTip = document.getElementById('statusTip');
     const bgVideo = document.getElementById('bgVideo');
     const cozeContainer = document.getElementById('coze-container');
+    const startMask = document.getElementById('startMask');
+    const startBtn = document.getElementById('startBtn');
 
     /**************************
      * 纯JS HMAC-SHA256 零依赖
@@ -291,18 +338,32 @@
         document.addEventListener('touchstart', () => bgVideo.play(), { once: true });
       });
 
+      // 先加载Coze
       await waitCozeSdkReady();
       showStatus('正在初始化聊天组件...');
-      
       const cozeOk = await initCoze();
       if (!cozeOk) {
         showStatus('聊天组件初始化失败，请刷新重试', true);
         return;
       }
 
-      // Coze加载完成后，主动申请麦克风权限并启动语音监听
+      // 显示启动引导，等待用户点击后再启动语音（适配移动端限制）
+      showStatus('点击屏幕按钮启动语音服务', false, false);
+    });
+
+    // 点击启动按钮，正式启动语音服务
+    startBtn.addEventListener('click', async () => {
+      startMask.style.display = 'none';
       showStatus('正在申请麦克风权限...');
-      setTimeout(() => startWakeUpListen(), 1000);
+      // 用户手势触发，启动语音监听
+      await startWakeUpListen();
+    });
+
+    // 页面可见性变化时恢复音频上下文
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && audioContext && audioContext.state === 'suspended') {
+        audioContext.resume();
+      }
     });
 
     function waitCozeSdkReady() {
@@ -411,7 +472,7 @@
       try {
         if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器不支持语音功能');
         
-        // 主动申请麦克风权限
+        // 用户手势触发的麦克风申请
         mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
@@ -427,6 +488,10 @@
         audioContext = new (window.AudioContext || window.webkitAudioContext)({
           sampleRate: actualSampleRate
         });
+        // 移动端必须手动resume解锁
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume();
+        }
 
         const source = audioContext.createMediaStreamSource(mediaStream);
         scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
@@ -448,7 +513,7 @@
         if (err.name === 'NotAllowedError') msg = '麦克风权限被拒绝，请在浏览器设置中允许';
         if (err.name === 'NotFoundError') msg = '未检测到麦克风设备';
         if (err.name === 'NotSupportedError') msg = '当前浏览器不支持语音采集';
-        showStatus('麦克风启动失败：' + msg, true);
+        showStatus('麦克风启动失败：' + msg, true, false);
         return false;
       }
     }
@@ -481,6 +546,7 @@
           sendFirstFrame();
           isListening = true;
           reconnectCount = 0;
+          recognizeCache = '';
           showStatus('语音监听已启动，说「你好小玄」唤醒我', false, false);
         };
 
@@ -491,10 +557,18 @@
               showStatus('语音识别错误：' + res.message, true);
               return;
             }
+            // 拼接识别结果
             if (res.data?.result?.ws) {
               let text = '';
               res.data.result.ws.forEach(item => text += item.cw[0].w);
-              handleRecognitionResult(text, res.data.result.pgs === 'rpl');
+              
+              // 滑动缓存识别文本，解决流式分段问题
+              recognizeCache += text;
+              if (recognizeCache.length > CONFIG.wake.cacheLength) {
+                recognizeCache = recognizeCache.slice(-CONFIG.wake.cacheLength);
+              }
+
+              handleRecognitionResult(recognizeCache);
             }
           } catch (e) {
             console.error('解析结果失败:', e);
@@ -514,7 +588,7 @@
         };
       } catch (e) {
         console.error('连接讯飞失败:', e);
-        showStatus('语音服务连接失败：' + e.message, true);
+        showStatus('语音服务连接失败：' + e.message, true, false);
       }
     }
 
@@ -525,15 +599,16 @@
           language: 'zh_cn',
           domain: 'iat',
           accent: 'mandarin',
-          vad_eos: 2000
+          vad_eos: 2000,
+          punc: 0
         },
-        data: { status: 0, format: 'audio/L16;rate=16000', audio: '' }
+        data: { status: 0, format: 'audio/L16;rate=16000', audio: '', encoding: 'raw' }
       }));
     }
 
     function sendAudioFrame(audioBase64) {
       ws.send(JSON.stringify({
-        data: { status: 1, format: 'audio/L16;rate=16000', audio: audioBase64 }
+        data: { status: 1, format: 'audio/L16;rate=16000', audio: audioBase64, encoding: 'raw' }
       }));
     }
 
@@ -544,28 +619,33 @@
     }
 
     /**************************
-     * 唤醒 + 对话逻辑
+     * 唤醒匹配 + 对话逻辑（核心优化）
      **************************/
-    function handleRecognitionResult(text, isReplace) {
+    function handleRecognitionResult(cacheText) {
+      // 对话模式：累积识别结果，静默后发送
       if (isConversing) {
-        finalText = isReplace ? text : finalText + text;
+        finalText = cacheText;
         clearTimeout(silenceTimer);
         silenceTimer = setTimeout(sendUserMessage, CONFIG.wake.silenceTime);
         return;
       }
 
-      const match = CONFIG.wake.keywords.some(keyword => text.includes(keyword));
+      // 待唤醒模式：匹配唤醒词（模糊匹配，包含任意唤醒词即触发）
+      const match = CONFIG.wake.keywords.some(keyword => cacheText.includes(keyword));
       if (match) wakeUpSuccess();
     }
 
+    // 唤醒成功
     function wakeUpSuccess() {
       isConversing = true;
       finalText = '';
+      recognizeCache = ''; // 清空缓存，避免重复唤醒
       showStatus('我在呢，请说话~', false, true);
       clearTimeout(noSpeakTimer);
       noSpeakTimer = setTimeout(endConversation, CONFIG.wake.maxNoSpeakTime);
     }
 
+    // 发送用户消息给Coze
     function sendUserMessage() {
       clearTimeout(silenceTimer);
       clearTimeout(noSpeakTimer);
@@ -581,11 +661,13 @@
       setTimeout(endConversation, CONFIG.wake.coolDownTime);
     }
 
+    // 结束对话，回到待唤醒
     function endConversation() {
       clearTimeout(silenceTimer);
       clearTimeout(noSpeakTimer);
       isConversing = false;
       finalText = '';
+      recognizeCache = '';
       
       stopWakeUpListen();
       setTimeout(() => {
