@@ -79,10 +79,11 @@
 </head>
 <body>
   <video id="bgVideo" autoplay loop muted playsinline webkit-playsinline x5-playsinline x5-video-player-type="h5">
-    <!-- 部署后替换为你的视频线上地址 -->
+    <!-- 改为相对路径，同目录放 logo.mp4 即可 -->
+    <source src="./logo.mp4" type="video/mp4">
   </video>
 
-  <div id="statusTip">系统启动中...</div>
+  <div id="statusTip">系统加载中...</div>
   <div id="coze-container"></div>
 
   <script>
@@ -99,16 +100,13 @@
         api_key: '4377ec3322ec3acb7247e80f686d27c5',
         api_secret: 'MTY5NjZmMzgxNWVlMTgyNGI1MGNhODI4',
         host: 'iat-api.xfyun.cn',
-        path: '/v2/iat'
+        path: '/v2/iat',
+        targetSampleRate: 16000
       },
       wake: {
         keywords: ['你好小玄', '你好小旋', '你好小璇', '你好小炫', '你好小选', '你好小轩'],
         coolDownTime: 5000,
         silenceTime: 1500
-      },
-      audio: {
-        sampleRate: 16000,
-        channelCount: 1
       }
     };
 
@@ -127,7 +125,7 @@
     const statusTip = document.getElementById('statusTip');
 
     /**************************
-     * 纯JS内联HMAC-SHA256实现（零依赖，兼容所有环境）
+     * 纯JS内联HMAC-SHA256实现（零依赖）
      **************************/
     (function() {
       function add(x, y) {
@@ -268,6 +266,20 @@
     })();
 
     /**************************
+     * 音频重采样工具（兼容所有设备采样率）
+     **************************/
+    function downsampleTo16k(inputData, inputSampleRate, targetSampleRate) {
+      if (inputSampleRate === targetSampleRate) return inputData;
+      const ratio = inputSampleRate / targetSampleRate;
+      const outputLength = Math.floor(inputData.length / ratio);
+      const output = new Float32Array(outputLength);
+      for (let i = 0; i < outputLength; i++) {
+        output[i] = inputData[Math.floor(i * ratio)];
+      }
+      return output;
+    }
+
+    /**************************
      * 讯飞鉴权URL生成
      **************************/
     function generateAuthUrl() {
@@ -293,21 +305,29 @@
         document.addEventListener('touchstart', () => bgVideo.play(), { once: true });
       });
 
-      // 2. 检测Coze SDK是否加载
-      if (typeof CozeWebSDK === 'undefined') {
-        showStatus('聊天组件加载失败，请检查网络', true);
-        return;
-      }
+      // 2. 检测Coze SDK是否加载成功
+      let sdkLoaded = false;
+      const checkSdk = setInterval(() => {
+        if (typeof CozeWebSDK !== 'undefined') {
+          sdkLoaded = true;
+          clearInterval(checkSdk);
+          showStatus('正在初始化聊天组件...');
+          setTimeout(() => initCoze(), 500);
+          setTimeout(() => startWakeUpListen(), 2000);
+        }
+      }, 200);
 
-      // 3. 初始化Coze
-      setTimeout(() => initCoze(), 1000);
-
-      // 4. 启动语音监听
-      setTimeout(() => startWakeUpListen(), 2500);
+      // 超时提示
+      setTimeout(() => {
+        if (!sdkLoaded) {
+          clearInterval(checkSdk);
+          showStatus('聊天组件加载超时，请检查网络', true);
+        }
+      }, 10000);
     });
 
     /**************************
-     * Coze SDK 初始化（官方规范参数）
+     * Coze SDK 初始化
      **************************/
     function initCoze() {
       try {
@@ -330,7 +350,7 @@
             setTimeout(() => {
               cozeClient.showChatBot();
               showStatus('聊天界面已就绪');
-            }, 500);
+            }, 300);
           },
           onError: (err) => {
             console.error('Coze SDK错误:', err);
@@ -344,24 +364,26 @@
     }
 
     /**************************
-     * 音频采集模块
+     * 音频采集模块（移除强制采样率，自适应设备）
      **************************/
     async function startAudioCapture() {
       try {
         if (!navigator.mediaDevices?.getUserMedia) {
           throw new Error('当前环境不支持音频采集');
         }
+        // 【关键修复】去掉强制采样率约束，只保留基础音频参数
         mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: {
-            sampleRate: CONFIG.audio.sampleRate,
-            channelCount: CONFIG.audio.channelCount,
+            channelCount: 1,
             echoCancellation: true,
-            noiseSuppression: true
+            noiseSuppression: true,
+            autoGainControl: true
           }
         });
 
+        const actualSampleRate = mediaStream.getAudioTracks()[0].getSettings().sampleRate || 48000;
         audioContext = new (window.AudioContext || window.webkitAudioContext)({
-          sampleRate: CONFIG.audio.sampleRate
+          sampleRate: actualSampleRate
         });
 
         const source = audioContext.createMediaStreamSource(mediaStream);
@@ -372,14 +394,19 @@
         scriptProcessor.onaudioprocess = (e) => {
           if (!isListening || ws?.readyState !== WebSocket.OPEN) return;
           const inputData = e.inputBuffer.getChannelData(0);
-          const pcmData = floatTo16BitPCM(inputData);
+          // 重采样到16k
+          const resampled = downsampleTo16k(inputData, actualSampleRate, CONFIG.xunfei.targetSampleRate);
+          const pcmData = floatTo16BitPCM(resampled);
           const base64 = arrayBufferToBase64(pcmData.buffer);
           sendAudioFrame(base64);
         };
         return true;
       } catch (err) {
         console.error('麦克风采集失败:', err);
-        showStatus('麦克风启动失败：' + err.message, true);
+        let msg = err.message;
+        if (err.name === 'NotAllowedError') msg = '麦克风权限被拒绝，请在浏览器设置中允许';
+        if (err.name === 'NotFoundError') msg = '未检测到麦克风设备，请检查设备连接';
+        showStatus('麦克风启动失败：' + msg, true);
         return false;
       }
     }
@@ -396,7 +423,7 @@
     function arrayBufferToBase64(buffer) {
       let binary = '';
       const bytes = new Uint8Array(buffer);
-      for (let i = 0; i < bytes.byteLength; i++) {
+      for (let i = 0; i < bytes.length; i++) {
         binary += String.fromCharCode(bytes[i]);
       }
       return btoa(binary);
