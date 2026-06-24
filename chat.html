@@ -128,7 +128,7 @@
       height: 70px;
       background: #1a1a1a;
       border-top: 1px solid #333;
-      z-index: 9999;
+      z-index: 99999 !important;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -253,7 +253,7 @@
     const manualVoiceBar = document.getElementById('manualVoiceBar');
 
     /**************************
-     * 原生Web Crypto 鉴权工具（100% 符合讯飞规范）
+     * 原生Web Crypto 鉴权工具
      **************************/
     async function hmacSha256(message, secret) {
       const encoder = new TextEncoder();
@@ -265,7 +265,7 @@
         false, ['sign']
       );
       const signature = await crypto.subtle.sign('HMAC', cryptoKey, msgData);
-      return signature; // 返回ArrayBuffer二进制结果
+      return signature;
     }
 
     function arrayBufferToBase64(buffer) {
@@ -277,22 +277,17 @@
       return btoa(binary);
     }
 
-    // 生成讯飞鉴权URL - 严格对齐官方文档
+    // 生成讯飞鉴权URL
     async function generateAuthUrl() {
       const date = new Date().toUTCString();
-      // 严格三行签名串，换行符必须是 \n
       const signStr = `host: ${CONFIG.xunfei.host}\ndate: ${date}\nGET ${CONFIG.xunfei.path} HTTP/1.1`;
       
-      // HMAC-SHA256 签名后直接转 base64
       const signBuffer = await hmacSha256(signStr, CONFIG.xunfei.api_secret);
       const signature = arrayBufferToBase64(signBuffer);
       
-      // 拼接 authorization 原始串
       const authOrigin = `api_key="${CONFIG.xunfei.api_key}", algorithm="hmac-sha256", headers="host date request-line", signature="${signature}"`;
-      // 整体再做一次 base64
       const authorization = btoa(authOrigin);
       
-      // 拼接最终 wss 地址
       return `wss://${CONFIG.xunfei.host}${CONFIG.xunfei.path}?authorization=${encodeURIComponent(authorization)}&date=${encodeURIComponent(date)}&host=${CONFIG.xunfei.host}`;
     }
 
@@ -337,10 +332,16 @@
       await startWakeUpListen();
     });
 
-    // 手动语音按钮事件
+    /**************************
+     * 手动语音按钮逻辑（修复无反应问题）
+     **************************/
     const startManualRecord = (e) => {
       e.preventDefault();
-      if (!isListening) return;
+      // 未连接时给出提示，不静默退出
+      if (!isListening || ws?.readyState !== WebSocket.OPEN) {
+        showStatus('语音服务未就绪，请稍候再试', true, true);
+        return;
+      }
       isManualMode = true;
       isConversing = true;
       finalText = '';
@@ -356,6 +357,7 @@
       voiceBtn.classList.remove('recording');
       voiceBtn.textContent = '按住说话';
       
+      // 有识别内容就发送
       if (finalText.trim() && cozeClient) {
         cozeClient.sendMessage({
           content: finalText.trim(),
@@ -373,6 +375,7 @@
       setTimeout(() => startWakeUpListen(), 500);
     };
 
+    // 同时绑定鼠标和触摸事件，兼容电脑/平板/手机
     voiceBtn.addEventListener('mousedown', startManualRecord);
     voiceBtn.addEventListener('mouseup', endManualRecord);
     voiceBtn.addEventListener('mouseleave', endManualRecord);
@@ -544,16 +547,25 @@
     }
 
     /**************************
-     * 讯飞WebSocket连接
+     * 讯飞WebSocket连接（修复10163参数错误）
      **************************/
     async function connectXunfei() {
       try {
-        // 异步生成鉴权地址
         const wsUrl = await generateAuthUrl();
         ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
-          sendFirstFrame();
+          // 移除非法的punc参数，只保留官方标准参数
+          ws.send(JSON.stringify({
+            common: { app_id: CONFIG.xunfei.app_id },
+            business: {
+              language: 'zh_cn',
+              domain: 'iat',
+              accent: 'mandarin',
+              vad_eos: 2000
+            },
+            data: { status: 0, format: 'audio/L16;rate=16000', audio: '' }
+          }));
           isListening = true;
           reconnectCount = 0;
           recognizeCache = '';
@@ -569,11 +581,20 @@
               console.error('讯飞识别错误:', res);
               return;
             }
+
+            // 修复流式识别结果处理：支持替换(rpl)和增量两种模式
             if (res.data?.result?.ws) {
-              let text = '';
-              res.data.result.ws.forEach(item => text += item.cw[0].w);
-              
-              recognizeCache += text;
+              let segmentText = '';
+              res.data.result.ws.forEach(item => segmentText += item.cw[0].w);
+
+              // pgs=rpl 表示本段替换之前的临时结果
+              if (res.data.result.pgs === 'rpl') {
+                recognizeCache = segmentText;
+              } else {
+                recognizeCache += segmentText;
+              }
+
+              // 滑动缓存长度限制
               if (recognizeCache.length > CONFIG.wake.cacheLength) {
                 recognizeCache = recognizeCache.slice(-CONFIG.wake.cacheLength);
               }
@@ -609,24 +630,12 @@
       }
     }
 
-    function sendFirstFrame() {
-      ws.send(JSON.stringify({
-        common: { app_id: CONFIG.xunfei.app_id },
-        business: {
-          language: 'zh_cn',
-          domain: 'iat',
-          accent: 'mandarin',
-          vad_eos: 2000,
-          punc: 0
-        },
-        data: { status: 0, format: 'audio/L16;rate=16000', audio: '', encoding: 'raw' }
-      }));
-    }
-
     function sendAudioFrame(audioBase64) {
-      ws.send(JSON.stringify({
-        data: { status: 1, format: 'audio/L16;rate=16000', audio: audioBase64, encoding: 'raw' }
-      }));
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          data: { status: 1, format: 'audio/L16;rate=16000', audio: audioBase64 }
+        }));
+      }
     }
 
     function sendEndFrame() {
@@ -639,11 +648,13 @@
      * 唤醒 + 对话逻辑
      **************************/
     function handleRecognitionResult(cacheText) {
+      // 手动说话模式：只累积文本，不触发唤醒
       if (isManualMode) {
         finalText = cacheText;
         return;
       }
 
+      // 对话模式：累积文本，静默后自动发送
       if (isConversing) {
         finalText = cacheText;
         clearTimeout(silenceTimer);
@@ -651,6 +662,7 @@
         return;
       }
 
+      // 待唤醒模式：匹配唤醒词
       const match = CONFIG.wake.keywords.some(keyword => cacheText.includes(keyword));
       if (match) wakeUpSuccess();
     }
