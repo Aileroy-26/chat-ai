@@ -148,7 +148,6 @@
       -webkit-user-select: none;
       touch-action: none;
     }
-    #voiceBtn:active,
     #voiceBtn.recording {
       background: linear-gradient(135deg, #ff4d4f, #cf1322);
     }
@@ -235,7 +234,8 @@
     let mediaStream = null;
     let audioContext = null;
     let scriptProcessor = null;
-    let isListening = false;
+    let isListening = false;      // 音频帧是否允许发送
+    let sessionReady = false;     // 讯飞会话是否创建成功
     let isConversing = false;
     let isManualMode = false;
     let silenceTimer = null;
@@ -243,7 +243,7 @@
     let finalText = '';
     let recognizeCache = '';
     let reconnectCount = 0;
-    const maxReconnect = 3;
+    const maxReconnect = 5;
     const statusTip = document.getElementById('statusTip');
     const bgVideo = document.getElementById('bgVideo');
     const cozeContainer = document.getElementById('coze-container');
@@ -253,7 +253,7 @@
     const manualVoiceBar = document.getElementById('manualVoiceBar');
 
     /**************************
-     * 原生Web Crypto 鉴权工具
+     * 原生Web Crypto 鉴权工具（100% 兼容讯飞规范）
      **************************/
     async function hmacSha256(message, secret) {
       const encoder = new TextEncoder();
@@ -333,12 +333,11 @@
     });
 
     /**************************
-     * 手动语音按钮逻辑（修复无反应问题）
+     * 手动语音按钮逻辑
      **************************/
     const startManualRecord = (e) => {
       e.preventDefault();
-      // 未连接时给出提示，不静默退出
-      if (!isListening || ws?.readyState !== WebSocket.OPEN) {
+      if (!sessionReady || ws?.readyState !== WebSocket.OPEN) {
         showStatus('语音服务未就绪，请稍候再试', true, true);
         return;
       }
@@ -347,7 +346,7 @@
       finalText = '';
       recognizeCache = '';
       voiceBtn.classList.add('recording');
-      voiceBtn.textContent = '松开结束说话';
+      voiceBtn.textContent = '正在聆听...';
       clearTimeout(silenceTimer);
     };
 
@@ -357,12 +356,13 @@
       voiceBtn.classList.remove('recording');
       voiceBtn.textContent = '按住说话';
       
-      // 有识别内容就发送
       if (finalText.trim() && cozeClient) {
         cozeClient.sendMessage({
           content: finalText.trim(),
           contentType: 'text'
         });
+      } else if (!finalText.trim()) {
+        showStatus('未识别到语音内容，请重试', true, true);
       }
 
       isManualMode = false;
@@ -375,7 +375,6 @@
       setTimeout(() => startWakeUpListen(), 500);
     };
 
-    // 同时绑定鼠标和触摸事件，兼容电脑/平板/手机
     voiceBtn.addEventListener('mousedown', startManualRecord);
     voiceBtn.addEventListener('mouseup', endManualRecord);
     voiceBtn.addEventListener('mouseleave', endManualRecord);
@@ -518,7 +517,8 @@
         scriptProcessor.connect(audioContext.destination);
 
         scriptProcessor.onaudioprocess = (e) => {
-          if (!isListening || ws?.readyState !== WebSocket.OPEN) return;
+          // 只有会话创建成功后才发送音频帧，彻底解决10165乱序问题
+          if (!sessionReady || !isListening || ws?.readyState !== WebSocket.OPEN) return;
           const inputData = e.inputBuffer.getChannelData(0);
           const resampled = downsampleTo16k(inputData, actualSampleRate, CONFIG.xunfei.targetSampleRate);
           const pcmData = floatTo16BitPCM(resampled);
@@ -547,15 +547,16 @@
     }
 
     /**************************
-     * 讯飞WebSocket连接（修复10163参数错误）
+     * 讯飞WebSocket连接（核心修复10165）
      **************************/
     async function connectXunfei() {
       try {
+        sessionReady = false;
         const wsUrl = await generateAuthUrl();
         ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
-          // 移除非法的punc参数，只保留官方标准参数
+          // 严格对齐官方首帧格式，完整参数
           ws.send(JSON.stringify({
             common: { app_id: CONFIG.xunfei.app_id },
             business: {
@@ -564,12 +565,14 @@
               accent: 'mandarin',
               vad_eos: 2000
             },
-            data: { status: 0, format: 'audio/L16;rate=16000', audio: '' }
+            data: {
+              status: 0,
+              format: 'audio/L16;rate=16000',
+              audio: '',
+              encoding: 'raw'
+            }
           }));
           isListening = true;
-          reconnectCount = 0;
-          recognizeCache = '';
-          showStatus('语音监听已启动，说「你好小玄」唤醒我', false, false);
         };
 
         ws.onmessage = (event) => {
@@ -579,27 +582,46 @@
               const errMsg = `识别错误(${res.code})：${res.message}`;
               showStatus(errMsg, true, false);
               console.error('讯飞识别错误:', res);
+              sessionReady = false;
               return;
             }
 
-            // 修复流式识别结果处理：支持替换(rpl)和增量两种模式
+            // 收到有效响应，说明会话创建成功，标记为就绪
+            if (!sessionReady) {
+              sessionReady = true;
+              reconnectCount = 0;
+              recognizeCache = '';
+              showStatus('语音监听已启动，说「你好小玄」唤醒我', false, false);
+            }
+
+            // 处理识别结果
             if (res.data?.result?.ws) {
               let segmentText = '';
               res.data.result.ws.forEach(item => segmentText += item.cw[0].w);
 
-              // pgs=rpl 表示本段替换之前的临时结果
+              // 处理替换模式和增量模式
               if (res.data.result.pgs === 'rpl') {
                 recognizeCache = segmentText;
               } else {
                 recognizeCache += segmentText;
               }
 
-              // 滑动缓存长度限制
+              // 滑动缓存限制
               if (recognizeCache.length > CONFIG.wake.cacheLength) {
                 recognizeCache = recognizeCache.slice(-CONFIG.wake.cacheLength);
               }
 
               handleRecognitionResult(recognizeCache);
+
+              // 识别结束标记，自动重连保持持续监听
+              if (res.data.result.ls) {
+                setTimeout(() => {
+                  if (!isManualMode && !isConversing) {
+                    stopWakeUpListen();
+                    setTimeout(() => startWakeUpListen(), 300);
+                  }
+                }, 200);
+              }
             }
           } catch (e) {
             console.error('解析结果失败:', e);
@@ -608,17 +630,20 @@
 
         ws.onerror = (event) => {
           console.error('WebSocket错误:', event);
+          sessionReady = false;
           showStatus('语音连接异常，正在重连...', true, false);
         };
 
         ws.onclose = (event) => {
           isListening = false;
+          sessionReady = false;
           console.log('WebSocket关闭，code:', event.code, 'reason:', event.reason);
           
           if (event.code !== 1000 && event.code !== 1005) {
             showStatus(`连接断开(${event.code})：${event.reason || '连接异常'}`, true, false);
           }
 
+          // 非手动断开自动重连
           if (!isConversing && !isManualMode && reconnectCount < maxReconnect) {
             reconnectCount++;
             setTimeout(() => startWakeUpListen(), 2000);
@@ -633,7 +658,7 @@
     function sendAudioFrame(audioBase64) {
       if (ws?.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
-          data: { status: 1, format: 'audio/L16;rate=16000', audio: audioBase64 }
+          data: { status: 1, audio: audioBase64 }
         }));
       }
     }
@@ -648,13 +673,13 @@
      * 唤醒 + 对话逻辑
      **************************/
     function handleRecognitionResult(cacheText) {
-      // 手动说话模式：只累积文本，不触发唤醒
+      // 手动说话模式
       if (isManualMode) {
         finalText = cacheText;
         return;
       }
 
-      // 对话模式：累积文本，静默后自动发送
+      // 对话模式
       if (isConversing) {
         finalText = cacheText;
         clearTimeout(silenceTimer);
@@ -717,6 +742,7 @@
 
     function stopWakeUpListen() {
       isListening = false;
+      sessionReady = false;
       if (ws) { sendEndFrame(); ws.close(); ws = null; }
       if (mediaStream) {
         mediaStream.getAudioTracks().forEach(track => {
